@@ -46,17 +46,17 @@ and the `shr reg,0x30 ; cmp …,2` channel-type idiom. Relocatable struct offset
 are wildcarded, which is why it survived the peer-offset change `0xD8 → 0x108`
 between 7.3.3 and 7.4.6. Must match **exactly once** or it is skipped.
 
-### Network source  (enqueue `call` → 5× `NOP`)
+### Network source  (`xor eax,eax ; ret`, bytes `31 C0 C3`)
 The client never sends `messages.getSponsoredMessages`, so sponsored messages
-are never fetched. The MTProto enqueue `call` in the request serializer is
-replaced with NOPs; the serializer still runs its cleanup, so nothing leaks.
+are never fetched. The dedicated sender for that request type is neutralized at
+its **entry**: it transmits nothing and returns request-id 0. Its callers own
+the request object, so nothing leaks, and it can't crash (it just returns).
 
 Resolved from invariants, not offsets:
-TL constructor id **`0x3D6CE850`** → its writer function → the writer's
-caller (the serializer) → the one direct `call` set up with the request id in
-`EDX` and the api instance in `RCX` (the enqueue calling convention). This is
-register/offset independent, so it moved cleanly from `0x01503FAA` (7.3.3) to
-`0x01614C92` (7.4.6) with no change to the patcher.
+TL constructor id **`0x3D6CE850`** → its small writer function → the writer's
+sole caller, which *is* that sender. Call-graph + protocol constant only, so it
+moved cleanly from `0x01503EB0` (7.3.3) to `0x01614B20` (7.4.6) with no change
+to the patcher.
 
 ## Safety / behavior
 - Always makes a timestamped backup (`Telegram.exe.<ts>.bak`) before writing.

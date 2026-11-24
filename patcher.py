@@ -20,16 +20,17 @@ is still applied).
 
   NETWORK SOURCE- Stops the client from ever sending
                   `messages.getSponsoredMessages`, so channel sponsored
-                  messages are never fetched. The MTProto enqueue `call` in the
-                  request serializer is replaced with NOPs; the serializer still
-                  runs its cleanup, so no object is leaked. Located from the
-                  stable TL constructor id 0x3D6CE850 -> its writer function ->
-                  the writer's caller(s) (the serializer) -> the one direct call
-                  made with the request-id in EDX and the api instance in RCX
-                  (the enqueue calling convention, which is register/offset
-                  independent).
+                  messages are never fetched. The dedicated sender/serializer
+                  for that request type is neutralized at its entry
+                  (`xor eax,eax ; ret`): it builds and transmits nothing and
+                  returns request-id 0. Its callers own the request object, so
+                  nothing is leaked. Located from the stable TL constructor id
+                  0x3D6CE850 -> its (small) writer function -> the writer's sole
+                  caller, which is that sender. This uses only the protocol
+                  constant and the call graph, so it is register/offset
+                  independent and survived 7.3.3 -> 7.4.6 unchanged.
 
-Requires: Python 3, pefile, capstone.
+Requires: Python 3, pefile.  (capstone optional, for prettier previews.)
 
 GUI:   python patcher.py
 CLI:   python patcher.py --locate  <Telegram.exe>
@@ -62,7 +63,7 @@ DISPLAY_SIG_PATCHED = ("31 C0 C3 24 10 4C 8B 81 ?? ?? ?? ?? 48 8B D1 4D 8B 48 08
                        "49 8B C1 48 C1 E8 30 44 0F B6 D8 84 C0 75 ?? 4D 85 C0 74 ?? "
                        "41 F7 80 ?? ?? ?? ?? 00 20 00 00")
 DISPLAY_PATCH = bytes([0x31, 0xC0, 0xC3])      # xor eax,eax ; ret
-NOP5 = b"\x90" * 5
+NETWORK_PATCH = bytes([0x31, 0xC0, 0xC3])      # xor eax,eax ; ret  (sender -> no-op, id 0)
 
 
 def sig_to_regex(sig):
@@ -215,51 +216,24 @@ def _find_serializers(view):
     return sorted(serializers)
 
 
-def _is_mov_edx_reg(ins):
-    return (ins.mnemonic == "mov"
-            and re.match(r"^edx, [a-z][a-z0-9]{1,3}$", ins.op_str) is not None)
-
-
-def _is_mov_rcx(ins):
-    return ins.mnemonic == "mov" and ins.op_str.startswith("rcx,")
-
-
-def _find_enqueue_sites(view, srva, erva):
-    """Inside a serializer, the enqueue is the direct `call` set up with the
-    request id in EDX and the api instance in RCX. Returns list of
-    (file_off, already_noped)."""
-    if _CS is None:
-        raise PatchError("capstone is required to locate the network patch")
-    so = view.rva_to_off(srva)
-    code = bytes(view.raw[so:view.rva_to_off(erva)])
-    ins = list(_CS.disasm(code, view.image_base + srva))
-    out = []
-    for i in range(2, len(ins)):
-        if _is_mov_rcx(ins[i - 1]) and _is_mov_edx_reg(ins[i - 2]):
-            cur = ins[i]
-            off = view.rva_to_off(cur.address - view.image_base)
-            if cur.mnemonic == "call" and cur.bytes and cur.bytes[0] == 0xE8:
-                out.append((off, False))
-            elif cur.mnemonic == "nop" and bytes(view.raw[off:off + 5]) == NOP5:
-                out.append((off, True))
-    return out
-
-
 def locate_network(view):
-    serializers = _find_serializers(view)
+    """Neutralize the getSponsoredMessages sender at its entry. The sender is
+    the sole caller of the request's unique writer function."""
+    senders = _find_serializers(view)      # (start,end) rvas of the sender(s)
     entries = []
-    for (s, e) in serializers:
-        for off, noped in _find_enqueue_sites(view, s, e):
-            if noped:
-                entries.append(_entry(view, off, NOP5, None,
-                                      "network enqueue (already patched)"))
-            else:
-                orig = bytes(view.raw[off:off + 5])
-                entries.append(_entry(view, off, NOP5, orig, "network enqueue"))
+    for (s, e) in senders:
+        off = view.rva_to_off(s)
+        cur = bytes(view.raw[off:off + len(NETWORK_PATCH)])
+        if cur == NETWORK_PATCH:
+            entries.append(_entry(view, off, NETWORK_PATCH, None,
+                                  "network sender (already patched)"))
+        else:
+            entries.append(_entry(view, off, NETWORK_PATCH, cur,
+                                  "network sender (getSponsoredMessages)"))
     if not entries:
-        raise PatchError("could not locate the enqueue call in the serializer")
+        raise PatchError("could not locate the getSponsoredMessages sender")
     if len(entries) > 4:
-        raise PatchError("resolved %d enqueue candidates (too many); aborting"
+        raise PatchError("resolved %d sender candidates (too many); aborting"
                          % len(entries))
     return entries
 
