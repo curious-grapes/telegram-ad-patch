@@ -3,32 +3,37 @@
 """
 Telegram Desktop (Windows x64) sponsored-message patcher.
 
-Two independent, signature / constant-anchored patches for channel sponsored
-messages. Nothing is hardcoded to a fixed file offset; every location is found
-dynamically and must resolve to exactly one site or the patch aborts.
+Two independent patches for channel sponsored messages. Nothing is tied to a
+fixed file offset; every location is re-derived on each run from version-stable
+invariants and must resolve unambiguously, or that patch is skipped (the other
+is still applied).
 
   DISPLAY GATE  - Neutralizes the per-view "should this peer show sponsored
-                  messages?" predicate so it always returns false. Patch:
-                  the function entry becomes `xor eax,eax ; ret` (31 C0 C3).
-                  Pure boolean, no side effects. Found by a wildcarded byte
-                  signature (relocatable struct offsets wildcarded).
+                  messages?" predicate so it always returns false. Patch: the
+                  function entry becomes `xor eax,eax ; ret` (31 C0 C3). Pure
+                  boolean, no side effects. Located by a wildcarded byte
+                  signature (the `restricted_sponsored` 0x2000 flag test plus
+                  the `shr reg,0x30 ; cmp …,2` channel-type idiom); relocatable
+                  struct offsets are wildcarded, so it tolerates field moves
+                  (e.g. the peer offset changed 0xD8 -> 0x108 between 7.3.3 and
+                  7.4.6 and the signature still matched).
 
-  NETWORK SOURCE- Stops the client from ever sending the
-                  `messages.getSponsoredMessages` request, so channel
-                  sponsored messages are never even fetched. The MTProto
-                  enqueue call inside the request serializer is replaced with
-                  NOPs; the serializer still runs its own epilogue and frees
-                  the moved callback objects, so there is no leak. Located by
-                  following the stable TL constructor id 0x3D6CE850 -> its
-                  writer function -> the writer's unique caller (serializer)
-                  -> the enqueue call.
+  NETWORK SOURCE- Stops the client from ever sending
+                  `messages.getSponsoredMessages`, so channel sponsored
+                  messages are never fetched. The MTProto enqueue `call` in the
+                  request serializer is replaced with NOPs; the serializer still
+                  runs its cleanup, so no object is leaked. Located from the
+                  stable TL constructor id 0x3D6CE850 -> its writer function ->
+                  the writer's caller(s) (the serializer) -> the one direct call
+                  made with the request-id in EDX and the api instance in RCX
+                  (the enqueue calling convention, which is register/offset
+                  independent).
 
-Requires: Python 3, pefile.  (capstone optional, used only to pretty-print the
-patched instructions for verification.)
+Requires: Python 3, pefile, capstone.
 
 GUI:   python patcher.py
-CLI:   python patcher.py --locate <Telegram.exe>
-       python patcher.py --patch display|network|both <Telegram.exe>
+CLI:   python patcher.py --locate  <Telegram.exe>
+       python patcher.py --patch   display|network|both  <Telegram.exe>
        python patcher.py --restore <Telegram.exe>
 """
 
@@ -38,7 +43,6 @@ try:
     import pefile
 except ImportError:
     pefile = None
-
 try:
     import capstone
     _CS = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
@@ -46,22 +50,18 @@ except Exception:
     capstone = None
     _CS = None
 
-TID_GETSPONSORED = 0x3D6CE850  # messages.getSponsoredMessages constructor id (v7.x)
+TID_GETSPONSORED = 0x3D6CE850          # messages.getSponsoredMessages ctor id
 
-# --- DISPLAY GATE signature -------------------------------------------------
-# Entry of the sponsored-eligibility predicate. Wildcards: the History/peer
-# struct offset (mov r8,[rcx+disp32]), two short jcc rel8 displacements, and the
-# channel-flags struct offset (test dword[r8+disp32], 0x2000). The 0x2000 ads
-# flag mask and the shr/movzx/test idiom pin it down. Patched at match start.
+# Display-gate entry signature. Wildcards: the peer struct offset, the two short
+# jcc displacements, and the channel-flags offset. 0x2000 ads flag + shr/cmp 2.
 DISPLAY_SIG = ("48 89 5C 24 10 4C 8B 81 ?? ?? ?? ?? 48 8B D1 4D 8B 48 08 "
                "49 8B C1 48 C1 E8 30 44 0F B6 D8 84 C0 75 ?? 4D 85 C0 74 ?? "
                "41 F7 80 ?? ?? ?? ?? 00 20 00 00")
-DISPLAY_PATCH = bytes([0x31, 0xC0, 0xC3])            # xor eax,eax ; ret
-
-# --- NETWORK enqueue micro-pattern (resolved *within* the serializer) -------
-# mov rcx,[rdi+0x10] ; <call rel32 = MTProto enqueue>.  Generic on its own, so
-# we only trust it inside the serializer function we reached via the TL id.
-ENQUEUE_PRE = bytes([0x48, 0x8B, 0x4F, 0x10])
+# Same, as it looks AFTER patching (first 3 bytes replaced by 31 C0 C3).
+DISPLAY_SIG_PATCHED = ("31 C0 C3 24 10 4C 8B 81 ?? ?? ?? ?? 48 8B D1 4D 8B 48 08 "
+                       "49 8B C1 48 C1 E8 30 44 0F B6 D8 84 C0 75 ?? 4D 85 C0 74 ?? "
+                       "41 F7 80 ?? ?? ?? ?? 00 20 00 00")
+DISPLAY_PATCH = bytes([0x31, 0xC0, 0xC3])      # xor eax,eax ; ret
 NOP5 = b"\x90" * 5
 
 
@@ -72,8 +72,11 @@ def sig_to_regex(sig):
     return re.compile(out, re.DOTALL)
 
 
+class PatchError(Exception):
+    pass
+
+
 class PEView:
-    """Thin helper over the raw file bytes with RVA<->offset mapping."""
     def __init__(self, path):
         if pefile is None:
             raise RuntimeError("pefile is required: pip install pefile")
@@ -87,10 +90,10 @@ class PEView:
                          if s.Name.rstrip(b"\x00") == b".text")
         self.text_lo = self.text.PointerToRawData
         self.text_hi = self.text_lo + self.text.SizeOfRawData
+        self.text_vrva = self.text.VirtualAddress
         self._pdata = None
 
     def close(self):
-        # pefile mmaps the file on Windows, which locks it; release before writing.
         try:
             self.pe.close()
         except Exception:
@@ -100,17 +103,6 @@ class PEView:
         try:
             self.pe.parse_data_directories(directories=[
                 pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
-            for fi in getattr(self.pe, "FileInfo", []):
-                for entry in fi:
-                    if getattr(entry, "Key", b"") == b"StringFileInfo":
-                        for st in entry.StringTable:
-                            for k, v in st.entries.items():
-                                if k in (b"FileVersion", b"ProductVersion"):
-                                    return v.decode(errors="replace")
-        except Exception:
-            pass
-        # fallback: fixed version info
-        try:
             vi = self.pe.VS_FIXEDFILEINFO[0]
             ms, ls = vi.FileVersionMS, vi.FileVersionLS
             return "%d.%d.%d.%d" % (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF)
@@ -134,20 +126,19 @@ class PEView:
         return None
 
     def pdata_funcs(self):
-        if self._pdata is not None:
-            return self._pdata
-        pd_sec = next((s for s in self.sections
+        if self._pdata is None:
+            pd = next((s for s in self.sections
                        if s.Name.rstrip(b"\x00") == b".pdata"), None)
-        funcs = []
-        if pd_sec:
-            a = pd_sec.PointerToRawData
-            data = self.raw[a:a + pd_sec.SizeOfRawData]
-            for i in range(0, len(data) - 11, 12):
-                beg, end, _unw = struct.unpack("<III", data[i:i + 12])
-                if beg or end:
-                    funcs.append((beg, end))
-            funcs.sort()
-        self._pdata = (funcs, [f[0] for f in funcs])
+            funcs = []
+            if pd:
+                data = self.raw[pd.PointerToRawData:
+                                pd.PointerToRawData + pd.SizeOfRawData]
+                for i in range(0, len(data) - 11, 12):
+                    beg, end, _ = struct.unpack("<III", data[i:i + 12])
+                    if beg or end:
+                        funcs.append((beg, end))
+                funcs.sort()
+            self._pdata = (funcs, [f[0] for f in funcs])
         return self._pdata
 
     def enclosing_func(self, rva):
@@ -157,96 +148,120 @@ class PEView:
             return funcs[i]
         return None
 
-
-# --------------------------------------------------------------------------
-# Locators. Each returns (file_offset, patch_bytes, orig_bytes, info) or raises.
-# --------------------------------------------------------------------------
-class PatchError(Exception):
-    pass
+    def text_bytes(self):
+        return bytes(self.raw[self.text_lo:self.text_hi])
 
 
-def locate_display(view):
-    rx = sig_to_regex(DISPLAY_SIG)
-    hits = [m.start() for m in rx.finditer(bytes(view.raw))]
-    if len(hits) == 0:
-        # maybe already patched: 31 C0 C3 then the tail of the signature
-        patched_sig = "31 C0 C3 24 10 4C 8B 81 ?? ?? ?? ?? 48 8B D1 4D 8B 48 08 49 8B C1 48 C1 E8 30"
-        ph = [m.start() for m in sig_to_regex(patched_sig).finditer(bytes(view.raw))]
-        if len(ph) == 1:
-            return (ph[0], DISPLAY_PATCH, None,
-                    "display gate ALREADY patched @0x%08x" % ph[0])
-        raise PatchError("display-gate signature not found "
-                         "(binary may be a different version)")
-    if len(hits) > 1:
-        raise PatchError("display-gate signature matched %d times (expected 1); "
-                         "aborting" % len(hits))
-    off = hits[0]
-    orig = bytes(view.raw[off:off + len(DISPLAY_PATCH)])
+def _entry(view, off, patch, orig, info):
     rva = view.off_to_rva(off)
-    info = "display gate @ file 0x%08x  RVA 0x%08x  VA 0x%x" % (
-        off, rva, view.image_base + rva)
-    return (off, DISPLAY_PATCH, orig, info)
+    return {"off": off, "patch": patch, "orig": orig,
+            "rva": rva, "va": view.image_base + rva, "info": info}
 
 
-def locate_network(view):
-    tid = struct.pack("<I", TID_GETSPONSORED)        # 50 e8 6c 3d
-    tb = bytes(view.raw[view.text_lo:view.text_hi])
-    # 1) occurrences of the constructor id inside .text
-    id_offs = [view.text_lo + m.start() for m in re.finditer(re.escape(tid), tb)]
+# --------------------------------------------------------------------------
+# DISPLAY gate
+# --------------------------------------------------------------------------
+def locate_display(view):
+    raw = bytes(view.raw)
+    hits = [m.start() for m in sig_to_regex(DISPLAY_SIG).finditer(raw)]
+    if len(hits) > 1:
+        raise PatchError("display-gate signature matched %d times (expected 1)"
+                         % len(hits))
+    if len(hits) == 1:
+        off = hits[0]
+        orig = bytes(view.raw[off:off + len(DISPLAY_PATCH)])
+        e = _entry(view, off, DISPLAY_PATCH, orig, "display gate")
+        return [e]
+    ph = [m.start() for m in sig_to_regex(DISPLAY_SIG_PATCHED).finditer(raw)]
+    if len(ph) == 1:
+        e = _entry(view, ph[0], DISPLAY_PATCH, None, "display gate (already patched)")
+        return [e]
+    raise PatchError("display-gate signature not found "
+                     "(unsupported / changed version)")
+
+
+# --------------------------------------------------------------------------
+# NETWORK source
+# --------------------------------------------------------------------------
+def _find_serializers(view):
+    """getSponsoredMessages TL id -> small writer function(s) -> their callers."""
+    tb = view.text_bytes()
+    tvs, tlo = view.text_vrva, view.text_lo
+    id_bytes = struct.pack("<I", TID_GETSPONSORED)
+    id_offs = [tlo + m.start() for m in re.finditer(re.escape(id_bytes), tb)]
     if not id_offs:
-        raise PatchError("getSponsoredMessages id 0x%08X not found" % TID_GETSPONSORED)
-    # 2) small enclosing functions = writer candidates
-    writer_rvas = set()
+        raise PatchError("getSponsoredMessages id 0x%08X not present"
+                         % TID_GETSPONSORED)
+    writers = set()
     for off in id_offs:
         rva = view.off_to_rva(off)
         fn = view.enclosing_func(rva) if rva is not None else None
-        if fn and (fn[1] - fn[0]) < 0x400:
-            writer_rvas.add(fn[0])
-    if not writer_rvas:
+        if fn and (fn[1] - fn[0]) < 0x400:          # small = the writer, not the
+            writers.add(fn[0])                      # giant response dispatcher
+    if not writers:
         raise PatchError("could not bound the request-writer function")
-    # 3) for each writer, find direct callers (e8 rel32 -> writer start)
-    serializers = []
-    for wrva in writer_rvas:
-        for m in re.finditer(b"\xe8", tb):
-            i = m.start()
-            if i + 5 > len(tb):
-                continue
-            rel = struct.unpack("<i", tb[i + 1:i + 5])[0]
-            call_rva = view.text.VirtualAddress + i
-            if call_rva + 5 + rel == wrva:
-                ser = view.enclosing_func(call_rva)
-                if ser:
-                    serializers.append(ser)
-    serializers = sorted(set(serializers))
+    serializers = set()
+    for m in re.finditer(b"\xe8", tb):              # direct call to a writer
+        i = m.start()
+        if i + 5 > len(tb):
+            continue
+        rel = struct.unpack("<i", tb[i + 1:i + 5])[0]
+        if tvs + i + 5 + rel in writers:
+            fn = view.enclosing_func(tvs + i)
+            if fn:
+                serializers.add(fn)
     if not serializers:
         raise PatchError("no caller of the request-writer found")
-    # 4) inside each serializer, find the enqueue call: 48 8B 4F 10  E8 rel32
-    targets = []
-    for (srva, erva) in serializers:
-        so = view.rva_to_off(srva)
-        eo = view.rva_to_off(erva)
-        body = bytes(view.raw[so:eo])
-        for m in re.finditer(re.escape(ENQUEUE_PRE) + b"\xe8", body):
-            call_off = so + m.start() + len(ENQUEUE_PRE)
-            targets.append(call_off)
-        # also detect the already-NOPed form
-        for m in re.finditer(re.escape(ENQUEUE_PRE) + NOP5, body):
-            call_off = so + m.start() + len(ENQUEUE_PRE)
-            targets.append(("nop", call_off))
-    plain = [t for t in targets if not isinstance(t, tuple)]
-    noped = [t[1] for t in targets if isinstance(t, tuple)]
-    if not plain and len(noped) == 1:
-        return (noped[0], NOP5, None,
-                "network source ALREADY patched @0x%08x" % noped[0])
-    if len(plain) != 1:
-        raise PatchError("network enqueue site resolved to %d candidates "
-                         "(expected 1); aborting" % len(plain))
-    off = plain[0]
-    orig = bytes(view.raw[off:off + 5])
-    rva = view.off_to_rva(off)
-    info = "network enqueue @ file 0x%08x  RVA 0x%08x  VA 0x%x" % (
-        off, rva, view.image_base + rva)
-    return (off, NOP5, orig, info)
+    return sorted(serializers)
+
+
+def _is_mov_edx_reg(ins):
+    return (ins.mnemonic == "mov"
+            and re.match(r"^edx, [a-z][a-z0-9]{1,3}$", ins.op_str) is not None)
+
+
+def _is_mov_rcx(ins):
+    return ins.mnemonic == "mov" and ins.op_str.startswith("rcx,")
+
+
+def _find_enqueue_sites(view, srva, erva):
+    """Inside a serializer, the enqueue is the direct `call` set up with the
+    request id in EDX and the api instance in RCX. Returns list of
+    (file_off, already_noped)."""
+    if _CS is None:
+        raise PatchError("capstone is required to locate the network patch")
+    so = view.rva_to_off(srva)
+    code = bytes(view.raw[so:view.rva_to_off(erva)])
+    ins = list(_CS.disasm(code, view.image_base + srva))
+    out = []
+    for i in range(2, len(ins)):
+        if _is_mov_rcx(ins[i - 1]) and _is_mov_edx_reg(ins[i - 2]):
+            cur = ins[i]
+            off = view.rva_to_off(cur.address - view.image_base)
+            if cur.mnemonic == "call" and cur.bytes and cur.bytes[0] == 0xE8:
+                out.append((off, False))
+            elif cur.mnemonic == "nop" and bytes(view.raw[off:off + 5]) == NOP5:
+                out.append((off, True))
+    return out
+
+
+def locate_network(view):
+    serializers = _find_serializers(view)
+    entries = []
+    for (s, e) in serializers:
+        for off, noped in _find_enqueue_sites(view, s, e):
+            if noped:
+                entries.append(_entry(view, off, NOP5, None,
+                                      "network enqueue (already patched)"))
+            else:
+                orig = bytes(view.raw[off:off + 5])
+                entries.append(_entry(view, off, NOP5, orig, "network enqueue"))
+    if not entries:
+        raise PatchError("could not locate the enqueue call in the serializer")
+    if len(entries) > 4:
+        raise PatchError("resolved %d enqueue candidates (too many); aborting"
+                         % len(entries))
+    return entries
 
 
 LOCATORS = {"display": locate_display, "network": locate_network}
@@ -254,16 +269,16 @@ LOCATORS = {"display": locate_display, "network": locate_network}
 
 def disasm_bytes(code, va):
     if _CS is None:
-        return "  (capstone not installed; raw bytes only)"
+        return "    (capstone not installed)"
     out = []
     for ins in _CS.disasm(bytes(code), va):
-        out.append("    0x%x: %-14s %s %s" % (
-            ins.address, ins.bytes.hex(" "), ins.mnemonic, ins.op_str))
-    return "\n".join(out) if out else "  (could not disassemble)"
+        out.append("    0x%x: %-16s %s %s" %
+                   (ins.address, ins.bytes.hex(" "), ins.mnemonic, ins.op_str))
+    return "\n".join(out) if out else "    (could not disassemble)"
 
 
 # --------------------------------------------------------------------------
-# Apply / restore
+# apply / restore
 # --------------------------------------------------------------------------
 def make_backup(path, log):
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -274,63 +289,81 @@ def make_backup(path, log):
 
 
 def apply_patches(path, which, log, do_backup=True):
-    """which: list subset of ['display','network']. Returns True on success."""
+    """Locate and apply each selected patch independently. A patch that cannot
+    be resolved is reported and skipped; the others still apply."""
     view = PEView(path)
     log("Target : %s" % path)
     log("Version: %s" % view.version())
-    log("ImageBase 0x%x  .text file[0x%x..0x%x]" %
-        (view.image_base, view.text_lo, view.text_hi))
+    log("ImageBase 0x%x" % view.image_base)
 
-    # locate everything first; abort entirely if any selected patch can't resolve
-    plans = []
+    located, failed = {}, {}
     for name in which:
-        off, patch, orig, info = LOCATORS[name](view)
-        log("\n[%s] %s" % (name.upper(), info))
-        rva = view.off_to_rva(off)
-        va = view.image_base + rva
-        if orig is None:
-            log("  -> already patched, nothing to do.")
-            continue
-        ctx = bytes(view.raw[off:off + max(len(patch), 16)])
-        log("  before: %s" % orig.hex(" "))
-        log(disasm_bytes(ctx, va))
-        log("  after : %s" % patch.hex(" "))
-        log(disasm_bytes(patch, va))
-        plans.append((name, off, patch, orig, va))
+        try:
+            located[name] = LOCATORS[name](view)
+        except PatchError as e:
+            failed[name] = str(e)
 
-    if not plans:
-        log("\nAll selected patches are already applied. No changes made.")
-        return True
+    to_write = []
+    for name in which:
+        if name in failed:
+            log("\n[%s] NOT RESOLVED: %s  (skipped)" % (name.upper(), failed[name]))
+            continue
+        for en in located[name]:
+            log("\n[%s] %s @ file 0x%08x  RVA 0x%08x  VA 0x%x" %
+                (name.upper(), en["info"], en["off"], en["rva"], en["va"]))
+            if en["orig"] is None:
+                log("  already patched, nothing to do.")
+                continue
+            ctx = bytes(view.raw[en["off"]:en["off"] + max(len(en["patch"]), 16)])
+            log("  before: %s" % en["orig"].hex(" "))
+            log(disasm_bytes(ctx, en["va"]))
+            log("  after : %s" % en["patch"].hex(" "))
+            log(disasm_bytes(en["patch"], en["va"]))
+            to_write.append(en)
+
+    if not located:
+        log("\nNothing could be located; no changes written.")
+        view.close()
+        return False
+    if not to_write:
+        log("\nAll located patches are already applied. No changes written.")
+        view.close()
+        return len(failed) == 0
 
     if do_backup:
         make_backup(path, log)
-
-    for name, off, patch, orig, va in plans:
-        view.raw[off:off + len(patch)] = patch
-    view.close()                     # release mmap/lock before writing
+    for en in to_write:
+        view.raw[en["off"]:en["off"] + len(en["patch"])] = en["patch"]
+    view.close()
     with open(path, "wb") as f:
         f.write(bytes(view.raw))
-    log("\nWrote %d patch(es) to %s" % (len(plans), path))
+    log("\nWrote %d patch site(s)." % len(to_write))
 
-    # verify by re-reading and disassembling
     verify = PEView(path)
-    ok = True
-    for name, off, patch, orig, va in plans:
-        now = bytes(verify.raw[off:off + len(patch)])
-        good = now == patch
-        ok = ok and good
-        log("  verify [%s] @0x%08x: %s  %s" %
-            (name, off, now.hex(" "), "OK" if good else "MISMATCH"))
-        log(disasm_bytes(now, va))
+    allok = True
+    for en in to_write:
+        now = bytes(verify.raw[en["off"]:en["off"] + len(en["patch"])])
+        good = now == en["patch"]
+        allok = allok and good
+        log("  verify @0x%08x: %s  %s" %
+            (en["off"], now.hex(" "), "OK" if good else "MISMATCH"))
+        log(disasm_bytes(now, en["va"]))
     verify.close()
-    log("\nRESULT: %s" % ("all patches verified OK" if ok else "VERIFY FAILED"))
-    return ok
+
+    if failed:
+        log("\nRESULT: applied [%s]; could NOT resolve [%s]." %
+            (", ".join(n for n in which if n not in failed),
+             ", ".join(failed)))
+    else:
+        log("\nRESULT: %s" % ("all selected patches verified OK" if allok
+                              else "VERIFY FAILED"))
+    return allok and not failed
 
 
 def list_backups(path):
-    d = os.path.dirname(os.path.abspath(path))
+    d = os.path.dirname(os.path.abspath(path)) or "."
     base = os.path.basename(path)
-    baks = [os.path.join(d, f) for f in os.listdir(d or ".")
+    baks = [os.path.join(d, f) for f in os.listdir(d)
             if f.startswith(base + ".") and f.endswith(".bak")]
     baks.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return baks
@@ -357,10 +390,9 @@ def run_gui():
 
     root = tk.Tk()
     root.title("Telegram sponsored-message patcher")
-    root.geometry("860x600")
+    root.geometry("880x620")
 
     pathvar = tk.StringVar()
-    # sensible default: working copy, else installed copy
     for guess in (os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "work", "Telegram.exe"),
                   os.path.join(os.environ.get("APPDATA", ""),
@@ -373,8 +405,8 @@ def run_gui():
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
     ttk.Label(top, text="Telegram.exe:").grid(row=0, column=0, sticky="w")
-    entry = ttk.Entry(top, textvariable=pathvar, width=78)
-    entry.grid(row=0, column=1, padx=6, sticky="we")
+    ttk.Entry(top, textvariable=pathvar, width=80).grid(row=0, column=1,
+                                                        padx=6, sticky="we")
 
     def browse():
         p = filedialog.askopenfilename(
@@ -389,20 +421,18 @@ def run_gui():
     box = ttk.LabelFrame(root, text="What to patch", padding=10)
     box.pack(fill="x", padx=10)
     ttk.Radiobutton(box, variable=modevar, value="display",
-                    text="Display gate only  - force the 'show sponsored?' check to false (safe, pure bool)"
-                    ).pack(anchor="w")
+                    text="Display gate only  - force the 'show sponsored?' check to false (safe, pure bool)").pack(anchor="w")
     ttk.Radiobutton(box, variable=modevar, value="network",
-                    text="Network source only - never send the getSponsoredMessages request (no fetch)"
-                    ).pack(anchor="w")
+                    text="Network source only - never send the getSponsoredMessages request (no fetch)").pack(anchor="w")
     ttk.Radiobutton(box, variable=modevar, value="both",
                     text="Both  (recommended)").pack(anchor="w")
 
-    logw = tk.Text(root, wrap="word", height=22,
+    logw = tk.Text(root, wrap="word", height=23,
                    font=("Consolas", 9) if sys.platform == "win32" else ("monospace", 9))
     logw.pack(fill="both", expand=True, padx=10, pady=10)
 
     def log(msg=""):
-        logw.insert("end", msg + "\n")
+        logw.insert("end", str(msg) + "\n")
         logw.see("end")
         root.update_idletasks()
 
@@ -417,16 +447,17 @@ def run_gui():
             messagebox.showerror("Error", "File not found:\n%s" % p); return
         try:
             v = PEView(p)
-            log("Version: %s   (%s)" % (v.version(), p))
+            log("Version: %s   (%s)\n" % (v.version(), p))
             for name in selected():
                 try:
-                    off, patch, orig, info = LOCATORS[name](v)
-                    log("[%s] %s" % (name.upper(), info))
-                    if orig is not None:
-                        log("   before %s  ->  after %s"
-                            % (orig.hex(" "), patch.hex(" ")))
+                    for en in LOCATORS[name](v):
+                        log("[%s] %s @ RVA 0x%08x" % (name.upper(), en["info"], en["rva"]))
+                        if en["orig"] is not None:
+                            log("    before %s  ->  after %s"
+                                % (en["orig"].hex(" "), en["patch"].hex(" ")))
                 except PatchError as e:
                     log("[%s] NOT RESOLVED: %s" % (name.upper(), e))
+            v.close()
         except Exception as e:
             log("ERROR: %s" % e)
 
@@ -440,36 +471,35 @@ def run_gui():
         if os.path.normcase(os.path.abspath(p)) == installed:
             if not messagebox.askyesno(
                     "Patch installed copy?",
-                    "This is your INSTALLED Telegram.exe.\n\n"
-                    "Telegram must be closed, auto-update will later overwrite "
-                    "the patch, and the Authenticode signature becomes invalid.\n\n"
-                    "A timestamped backup will be made. Continue?"):
+                    "This is your INSTALLED Telegram.exe.\n\nClose Telegram first. "
+                    "Auto-update will later overwrite the patch, and the code "
+                    "signature becomes invalid.\n\nA timestamped backup is made. "
+                    "Continue?"):
                 return
         try:
-            apply_patches(p, selected(), log, do_backup=True)
-            messagebox.showinfo("Done", "Patching finished - see the log.")
+            ok = apply_patches(p, selected(), log, do_backup=True)
+            messagebox.showinfo("Done", "Finished - see the log."
+                                if ok else "Finished with skips - see the log.")
         except Exception as e:
-            log("\nABORTED: %s" % e)
-            messagebox.showerror("Aborted", str(e))
+            log("\nERROR: %s" % e)
+            messagebox.showerror("Error", str(e))
 
     def do_restore():
         logw.delete("1.0", "end")
         p = pathvar.get()
-        baks = list_backups(p)
-        if not baks:
+        if not list_backups(p):
             messagebox.showwarning("No backup", "No *.bak file found next to the exe.")
             return
         bak = filedialog.askopenfilename(
             title="Choose a backup to restore",
             initialdir=os.path.dirname(os.path.abspath(p)),
             filetypes=[("Backup", "*.bak"), ("All files", "*.*")])
-        if not bak:
-            return
-        try:
-            restore(p, log, bak)
-            messagebox.showinfo("Restored", "Original restored from backup.")
-        except Exception as e:
-            log("ERROR: %s" % e)
+        if bak:
+            try:
+                restore(p, log, bak)
+                messagebox.showinfo("Restored", "Original restored from backup.")
+            except Exception as e:
+                log("ERROR: %s" % e)
 
     btns = ttk.Frame(root, padding=(10, 0, 10, 10))
     btns.pack(fill="x")
@@ -486,14 +516,11 @@ def run_gui():
 
 def main():
     ap = argparse.ArgumentParser(description="Telegram sponsored-message patcher")
-    ap.add_argument("--locate", metavar="EXE", help="resolve patch sites, no writes")
-    ap.add_argument("--patch", nargs=2, metavar=("MODE", "EXE"),
-                    help="MODE = display | network | both")
-    ap.add_argument("--restore", metavar="EXE", help="restore newest .bak")
+    ap.add_argument("--locate", metavar="EXE")
+    ap.add_argument("--patch", nargs=2, metavar=("MODE", "EXE"))
+    ap.add_argument("--restore", metavar="EXE")
     args = ap.parse_args()
 
-    # In a --windowed (no-console) build there is no stdout/stderr; keep prints
-    # from crashing the CLI modes.
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
@@ -510,17 +537,18 @@ def main():
         log("Version: %s" % v.version())
         for name in ("display", "network"):
             try:
-                off, patch, orig, info = LOCATORS[name](v)
-                log("[%s] %s" % (name.upper(), info))
-                if orig is not None:
-                    va = v.image_base + v.off_to_rva(off)
-                    ctx = bytes(v.raw[off:off + max(len(patch), 16)])
-                    log("  before %s / after %s" % (orig.hex(" "), patch.hex(" ")))
-                    log(disasm_bytes(ctx, va))
-                    log("  -->")
-                    log(disasm_bytes(patch, va))
+                for en in LOCATORS[name](v):
+                    log("[%s] %s @ file 0x%08x  RVA 0x%08x  VA 0x%x" %
+                        (name.upper(), en["info"], en["off"], en["rva"], en["va"]))
+                    if en["orig"] is not None:
+                        log("  before %s / after %s" %
+                            (en["orig"].hex(" "), en["patch"].hex(" ")))
+                        log(disasm_bytes(bytes(v.raw[en["off"]:en["off"] + 16]), en["va"]))
+                        log("  -->")
+                        log(disasm_bytes(en["patch"], en["va"]))
             except PatchError as e:
                 log("[%s] NOT RESOLVED: %s" % (name.upper(), e))
+        v.close()
         return
     if args.patch:
         mode, exe = args.patch
